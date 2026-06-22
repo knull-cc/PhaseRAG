@@ -7,25 +7,23 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from easydict import EasyDict
 import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.loggers import CSVLogger
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PHASEFORMER_ROOT = PROJECT_ROOT / "PhaseFormer"
-for path in (PROJECT_ROOT, PHASEFORMER_ROOT):
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+for path in (PROJECT_ROOT.parent, PROJECT_ROOT):
     path_text = str(path)
     if path_text not in sys.path:
         sys.path.insert(0, path_text)
 
-import config.base_config as config_module
-from src.dataset.data_factory import data_provider
-from src.dataset.data_info import DATASET_INFO
-from src.models.PhaseFormer import PhaseFormer
-
+from PhaseRAG.config import base_config as config_module
+from PhaseRAG.config.base_config import AttrDict
+from PhaseRAG.dataset.data_factory import data_provider
+from PhaseRAG.dataset.data_info import DATASET_INFO
 from PhaseRAG.models import (
+    PhaseFormer,
     PhaseRAGForecaster,
     PhaseRetriever,
     PhaseTokenizer,
@@ -61,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def configure_experiment(args: argparse.Namespace) -> EasyDict:
+def configure_experiment(args: argparse.Namespace) -> AttrDict:
     exp_args = config_module.config
     dataset_info = DATASET_INFO[DATASET_NAME]
     model_args = exp_args.model_args
@@ -97,7 +95,7 @@ def configure_experiment(args: argparse.Namespace) -> EasyDict:
 
 
 class PhaseRAGETTh1Config:
-    def __init__(self, exp_args: EasyDict, args: argparse.Namespace) -> None:
+    def __init__(self, exp_args: AttrDict, args: argparse.Namespace) -> None:
         self.seq_len = args.seq_len
         self.pred_len = args.pred_len
         self.enc_in = exp_args.model_args.num_variants
@@ -133,7 +131,7 @@ class PhaseRAGETTh1Config:
         return getattr(self, key, default)
 
 
-def build_model(exp_args: EasyDict, args: argparse.Namespace) -> PhaseRAGForecaster:
+def build_model(exp_args: AttrDict, args: argparse.Namespace) -> PhaseRAGForecaster:
     model_config = PhaseRAGETTh1Config(exp_args, args)
     train_dataset, _ = data_provider(exp_args.dataset_args, "train")
 
@@ -175,7 +173,7 @@ def make_logger(args: argparse.Namespace) -> CSVLogger:
 
 
 def main() -> None:
-    os.chdir(PHASEFORMER_ROOT)
+    os.chdir(PROJECT_ROOT)
     torch.set_float32_matmul_precision("medium")
     pl.seed_everything(2021, workers=True)
 

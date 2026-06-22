@@ -1,9 +1,11 @@
 from PhaseRAG.models.phase_memory import PhaseMemoryBank, build_phase_memory_bank
+from PhaseRAG.models.phaseformer import PhaseFormer
 from PhaseRAG.models.phase_retriever import PhaseRetriever
 from PhaseRAG.models.phase_tokenizer import PhaseTokenizer
 
 __all__ = [
     "PhaseMemoryBank",
+    "PhaseFormer",
     "PhaseRAGForecaster",
     "PhaseRetriever",
     "PhaseTokenizer",

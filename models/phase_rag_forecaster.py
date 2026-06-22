@@ -1,21 +1,12 @@
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import torch
 from torch import nn
 
-PHASEFORMER_ROOT = Path(__file__).resolve().parents[2] / "PhaseFormer"
-if PHASEFORMER_ROOT.exists():
-    phaseformer_path = str(PHASEFORMER_ROOT)
-    if phaseformer_path not in sys.path:
-        sys.path.insert(0, phaseformer_path)
-
 from PhaseRAG.models.phase_retriever import PhaseRetriever
 from PhaseRAG.models.phase_tokenizer import PhaseTokenizer
-from src.models.pl_bases.default_module import DefaultPLModule
-from src.utils.metrics import metric
+from PhaseRAG.models.pl_bases.default_module import DefaultPLModule
+from PhaseRAG.utils.metrics import metric
 
 
 PhaseRAGOutput = tuple[
