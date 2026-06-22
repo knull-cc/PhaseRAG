@@ -11,7 +11,7 @@ import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.loggers import CSVLogger
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 for path in (PROJECT_ROOT.parent, PROJECT_ROOT):
@@ -24,29 +24,35 @@ from PhaseRAG.config.base_config import AttrDict
 from PhaseRAG.config.data_factory import data_provider
 from PhaseRAG.config.data_info import DATASET_INFO
 from PhaseRAG.models import (
-    PhaseFormer,
-    PhaseFormerForecaster,
     PhaseRAGForecaster,
-    PhaseRetriever,
-    PhaseTokenizer,
-    build_phase_memory_bank,
+    RaftRetriever,
+    build_raft_memory,
 )
 
 
-DEFAULT_NORM_HYPERS = {
-    "revin_affine": False,
-    "revin_eps": 1e-5,
-}
 DATASET_NAME = "ETTh1"
 
 
+class IndexedDataset(Dataset):
+    """Wraps a dataset so each item also yields its window-start index, which the
+    retriever uses to drop overlapping patches during training."""
+
+    def __init__(self, base: Dataset) -> None:
+        self.base = base
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, index: int):
+        return (*self.base[index], index)
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run PhaseRAG on ETTh1.")
+    parser = argparse.ArgumentParser(description="Run PhaseRAG (RAFT-in-phase) on ETTh1.")
     parser.add_argument("--seq-len", type=int, default=720)
     parser.add_argument("--pred-len", type=int, default=720)
     parser.add_argument("--period-len", type=int, default=24)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--pretrain-epochs", type=int, default=30)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -55,18 +61,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--memory-stride", type=int, default=1)
     parser.add_argument("--max-memory-items", type=int, default=4096)
     parser.add_argument("--lambda-base", type=float, default=0.1)
-    parser.add_argument("--gate-hidden-dim", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--shift-aware", action="store_true")
-    parser.add_argument("--freeze-backbone", action="store_true")
     parser.add_argument(
-        "--memory-split",
-        choices=("val", "train"),
-        default="val",
-        help="Where to build the residual memory / train the adapter. 'val' "
-        "avoids train/test error leakage so the retrieval actually helps.",
+        "--periods",
+        type=str,
+        default="1,2,4",
+        help="Comma-separated retrieval pooling periods, e.g. 1,2,4.",
     )
     return parser.parse_args()
+
+
+def parse_periods(text: str) -> tuple[int, ...]:
+    periods = tuple(int(token) for token in text.split(",") if token.strip())
+    if not periods or any(p <= 0 for p in periods):
+        raise ValueError("--periods must be positive integers")
+    return periods
 
 
 def configure_experiment(args: argparse.Namespace) -> AttrDict:
@@ -120,177 +129,55 @@ class PhaseRAGETTh1Config:
         self.phase_layers = 3
         self.phase_attn_heads = 1
         self.phase_attn_dropout = 0.1
-        self.phase_attn_use_relpos = True
-        self.phase_attn_window = None
         self.phase_attention_dim = None
         self.phase_num_routers = 8
         self.phase_use_pos_embed = True
         self.phase_pos_dropout = 0.0
 
-        self.use_revin = True
-        self.revin_affine = DEFAULT_NORM_HYPERS["revin_affine"]
-        self.revin_eps = DEFAULT_NORM_HYPERS["revin_eps"]
-        self.use_huber_loss = False
-        self.huber_delta = 1.0
-
         self.phase_rag_lambda_base = args.lambda_base
-        self.phase_rag_freeze_backbone = args.freeze_backbone
-        self.phase_rag_gate_hidden_dim = args.gate_hidden_dim
 
     def get(self, key: str, default: Any = None) -> Any:
         return getattr(self, key, default)
 
 
-def make_logger(args: argparse.Namespace, stage: str) -> CSVLogger:
-    shift_name = "shift" if args.shift_aware else "plain"
+def make_logger(args: argparse.Namespace) -> CSVLogger:
     version = (
-        f"{DATASET_NAME}-{args.seq_len}-{args.pred_len}-{stage}"
-        f"-p{args.period_len}-top{args.top_k}-{shift_name}"
+        f"{DATASET_NAME}-{args.seq_len}-{args.pred_len}-PhaseRAG"
+        f"-p{args.period_len}-top{args.top_k}-P{args.periods.replace(',', '')}"
         f"-mem{args.max_memory_items}-tau{args.temperature}"
     )
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return CSVLogger(
         save_dir="./log/training_results",
         name="PhaseRAG",
-        version=f"{version}-{stage}-{timestamp}",
+        version=f"{version}-{timestamp}",
     )
 
 
-def make_trainer(args: argparse.Namespace, stage: str, max_epochs: int) -> pl.Trainer:
-    return pl.Trainer(
-        accelerator="auto",
-        devices=1,
-        max_epochs=max_epochs,
-        logger=make_logger(args, stage),
-        callbacks=[EarlyStopping(monitor="val_loss", patience=args.patience)],
-        enable_checkpointing=True,
-        enable_progress_bar=True,
-        log_every_n_steps=1,
-        deterministic=True,
-    )
-
-
-def pretrain_backbone(
+def build_model(
     model_config: PhaseRAGETTh1Config,
     args: argparse.Namespace,
-    train_loader,
-    vali_loader,
-) -> PhaseFormer:
-    backbone = PhaseFormer(model_config)
-    stage1 = PhaseFormerForecaster(model_config, backbone=backbone)
-    trainer = make_trainer(args, "backbone", args.pretrain_epochs)
-    trainer.fit(stage1, train_dataloaders=train_loader, val_dataloaders=vali_loader)
-    backbone.eval()
-    return backbone
-
-
-def build_rag_model(
-    model_config: PhaseRAGETTh1Config,
-    args: argparse.Namespace,
-    backbone: PhaseFormer,
-    memory_dataset,
+    periods: tuple[int, ...],
+    memory_dataset: Dataset,
 ) -> PhaseRAGForecaster:
-    model_config.phase_rag_freeze_backbone = True
-    device = next(backbone.parameters()).device
-
-    tokenizer = PhaseTokenizer(phase_len=args.period_len)
-    memory_bank = build_phase_memory_bank(
+    memory = build_raft_memory(
         dataset=memory_dataset,
-        tokenizer=tokenizer,
         pred_len=args.pred_len,
-        backbone=backbone,
+        periods=periods,
         batch_size=args.batch_size,
         stride=args.memory_stride,
         max_items=args.max_memory_items,
         num_workers=args.num_workers,
-        device=device,
-        norm_eps=model_config.revin_eps,
     )
-    print(f"[PhaseRAG] memory bank size = {memory_bank.size}")
-    retriever = PhaseRetriever(
-        tokenizer=tokenizer,
-        memory_bank=memory_bank,
+    print(f"[PhaseRAG] RAFT memory size = {memory.size}, periods = {periods}")
+    retriever = RaftRetriever(
+        memory=memory,
+        pred_len=args.pred_len,
+        overlap_span=args.seq_len + args.pred_len,
         top_k=args.top_k,
         temperature=args.temperature,
-        similarity="cosine",
-        shift_aware=args.shift_aware,
-        norm_eps=model_config.revin_eps,
     )
-    return PhaseRAGForecaster(model_config, backbone=backbone, retriever=retriever)
-
-
-def _loader(dataset, args, shuffle: bool, drop_last: bool) -> DataLoader:
-    return DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=shuffle,
-        num_workers=args.num_workers,
-        drop_last=drop_last,
-    )
-
-
-def _contiguous_splits(length: int, gap: int) -> tuple[range, range, range]:
-    """Split [0, length) into disjoint memory / adapter-train / adapter-val
-    ranges (~60 / 25 / 15 of the usable space) with a gap between them to limit
-    window overlap. The two gaps are subtracted first so the regions always fit.
-    """
-    gap = max(0, min(gap, length // 20))
-    usable = length - 2 * gap
-    memory_len = int(usable * 0.60)
-    adapter_train_len = int(usable * 0.25)
-    memory_idx = range(0, memory_len)
-    adapter_train_start = memory_len + gap
-    adapter_train_idx = range(
-        adapter_train_start,
-        adapter_train_start + adapter_train_len,
-    )
-    adapter_val_idx = range(adapter_train_start + adapter_train_len + gap, length)
-    if min(len(memory_idx), len(adapter_train_idx), len(adapter_val_idx)) == 0:
-        raise ValueError(
-            "validation split is too small for leakage-free memory; "
-            "use --memory-split train or a shorter --pred-len"
-        )
-    return memory_idx, adapter_train_idx, adapter_val_idx
-
-
-def prepare_stage2_data(
-    args: argparse.Namespace,
-    exp_args: AttrDict,
-    train_dataset,
-    train_loader,
-    vali_loader,
-):
-    """Returns (memory_dataset, adapter_loader, adapter_val_loader).
-
-    With --memory-split val (default) the residual memory and the gate adapter
-    are built on the validation series, which the backbone never trained on, so
-    the stored residuals are genuine generalization errors rather than
-    overfit training noise. The three regions are disjoint to avoid retrieving a
-    sample's own future during adapter training/validation.
-    """
-    if args.memory_split == "train":
-        return train_dataset, train_loader, vali_loader
-
-    val_dataset, _ = data_provider(exp_args.dataset_args, "val")
-    gap = args.pred_len
-    memory_idx, adapter_train_idx, adapter_val_idx = _contiguous_splits(
-        len(val_dataset),
-        gap,
-    )
-    memory_dataset = Subset(val_dataset, list(memory_idx))
-    adapter_loader = _loader(
-        Subset(val_dataset, list(adapter_train_idx)),
-        args,
-        shuffle=True,
-        drop_last=False,
-    )
-    adapter_val_loader = _loader(
-        Subset(val_dataset, list(adapter_val_idx)),
-        args,
-        shuffle=False,
-        drop_last=False,
-    )
-    return memory_dataset, adapter_loader, adapter_val_loader
+    return PhaseRAGForecaster(model_config, retriever=retriever)
 
 
 def main() -> None:
@@ -299,32 +186,37 @@ def main() -> None:
     pl.seed_everything(2021, workers=True)
 
     args = parse_args()
+    periods = parse_periods(args.periods)
     exp_args = configure_experiment(args)
     model_config = PhaseRAGETTh1Config(exp_args, args)
 
-    train_dataset, train_loader = data_provider(exp_args.dataset_args, "train")
+    train_dataset, _ = data_provider(exp_args.dataset_args, "train")
     _, vali_loader = data_provider(exp_args.dataset_args, "val")
     _, test_loader = data_provider(exp_args.dataset_args, "test")
 
-    # Stage 1: train and freeze the PhaseFormer backbone on the full train set.
-    backbone = pretrain_backbone(model_config, args, train_loader, vali_loader)
+    # Retrieval library is the training history; query indices let the retriever
+    # exclude overlapping patches so a window never retrieves its own future.
+    train_loader = DataLoader(
+        IndexedDataset(train_dataset),
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        drop_last=True,
+    )
 
-    # Stage 2: build the residual memory from data the frozen backbone never
-    # trained on, then train only the retrieval adapter to correct its errors.
-    memory_dataset, adapter_loader, adapter_val_loader = prepare_stage2_data(
-        args,
-        exp_args,
-        train_dataset,
-        train_loader,
-        vali_loader,
+    model = build_model(model_config, args, periods, train_dataset)
+    trainer = pl.Trainer(
+        accelerator="auto",
+        devices=1,
+        max_epochs=args.epochs,
+        logger=make_logger(args),
+        callbacks=[EarlyStopping(monitor="val_loss", patience=args.patience)],
+        enable_checkpointing=True,
+        enable_progress_bar=True,
+        log_every_n_steps=1,
+        deterministic=True,
     )
-    model = build_rag_model(model_config, args, backbone, memory_dataset)
-    trainer = make_trainer(args, "rag", args.epochs)
-    trainer.fit(
-        model,
-        train_dataloaders=adapter_loader,
-        val_dataloaders=adapter_val_loader,
-    )
+    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=vali_loader)
     trainer.test(model, dataloaders=test_loader)
 
 

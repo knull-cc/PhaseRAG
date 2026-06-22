@@ -3,121 +3,64 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from PhaseRAG.models.phase_retriever import PhaseRetriever
-from PhaseRAG.models.phase_tokenizer import PhaseTokenizer, instance_normalize
+from PhaseRAG.models.phase_retriever import RaftRetriever
+from PhaseRAG.models.phase_tokenizer import PhaseTokenizer, offset_normalize
+from PhaseRAG.models.phaseformer import (
+    CrossPhaseRoutingUnit,
+    PhaseEmbedding,
+    PhasePredictor,
+)
 from PhaseRAG.models.pl_bases.default_module import DefaultPLModule
 from PhaseRAG.utils.metrics import metric
 
 
-PhaseRAGOutput = tuple[
-    torch.Tensor,
-    torch.Tensor,
-    dict[str, torch.Tensor],
-    dict[str, torch.Tensor],
-]
+class PhaseRAGForecaster(DefaultPLModule):
+    """RAFT-in-phase forecaster.
 
-GATE_FEATURE_DIM = 5
+    Pipeline (offset-normalized space):
+      1. retrieve real future patterns (multi-period RAFT retrieval),
+      2. tokenize both the input and the retrieved future into phase tokens,
+      3. concatenate them along the period axis,
+      4. a phase predictor produces the forecast,
+      5. add the offset back.
 
-
-class PhaseResidualAdapter(nn.Module):
-    """Gated fusion of a retrieved, scale-free residual correction.
-
-    The retrieved residual lives in the per-window normalized space, so it is
-    rescaled by the query's own std before being added (in the time domain) to
-    the backbone prediction. The gate only sees scale-invariant features
-    (similarities, confidence, normalized residual magnitude) so it is not
-    confused by raw-amplitude differences between series.
+    The ablation prediction ``y_base`` reuses the same predictor with the
+    retrieval evidence zeroed out, isolating what the retrieval contributes.
     """
 
-    def __init__(
-        self,
-        tokenizer: PhaseTokenizer,
-        pred_len: int,
-        hidden_dim: int = 32,
-        norm_eps: float = 1e-5,
-    ) -> None:
-        super().__init__()
-        self.tokenizer = tokenizer
-        self.pred_len = pred_len
-        self.norm_eps = norm_eps
-        self.gate = nn.Sequential(
-            nn.Linear(GATE_FEATURE_DIM, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid(),
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        y_base: torch.Tensor,
-        evidence: dict[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        residual_phase = evidence["retrieved_residual_phase"]
-        residual_time = self.tokenizer.to_time(residual_phase, self.pred_len)
-
-        _, _, std_x = instance_normalize(x, self.norm_eps)
-
-        gate = self._gate(residual_phase, evidence)
-        y_final = y_base + gate * residual_time * std_x
-        return y_final, {"gate": gate, "residual_time": residual_time}
-
-    def _gate(
-        self,
-        residual_phase: torch.Tensor,
-        evidence: dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        channel_count = residual_phase.size(1)
-        residual_scale = residual_phase.abs().mean(dim=(2, 3))
-
-        max_similarity = evidence["similarities"].max(dim=1).values
-        mean_similarity = evidence["similarities"].mean(dim=1)
-        confidence = evidence["confidence"].squeeze(-1)
-
-        max_similarity = max_similarity[:, None].expand(-1, channel_count)
-        mean_similarity = mean_similarity[:, None].expand(-1, channel_count)
-        confidence = confidence[:, None].expand(-1, channel_count)
-
-        gate_input = torch.stack(
-            [
-                residual_scale,
-                max_similarity,
-                mean_similarity,
-                confidence,
-                mean_similarity * confidence,
-            ],
-            dim=-1,
-        )
-        gate = self.gate(gate_input).squeeze(-1)
-        return gate[:, None, :]
-
-
-class PhaseRAGForecaster(DefaultPLModule):
-    """PhaseFormer wrapper with residual phase retrieval."""
-
-    def __init__(
-        self,
-        configs,
-        backbone: nn.Module,
-        retriever: PhaseRetriever,
-    ) -> None:
+    def __init__(self, configs, retriever: RaftRetriever) -> None:
         super().__init__(configs)
-        self.backbone = backbone
         self.retriever = retriever
+        self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
         self.lambda_base = float(getattr(configs, "phase_rag_lambda_base", 0.1))
-        self.freeze_backbone = bool(getattr(configs, "phase_rag_freeze_backbone", True))
-        gate_hidden_dim = int(getattr(configs, "phase_rag_gate_hidden_dim", 32))
-        norm_eps = float(getattr(configs, "revin_eps", 1e-5))
-        self.adapter = PhaseResidualAdapter(
-            tokenizer=retriever.tokenizer,
-            pred_len=self.pred_len,
-            hidden_dim=gate_hidden_dim,
-            norm_eps=norm_eps,
-        )
 
-        if self.freeze_backbone:
-            self._freeze_backbone()
+        period_len = int(configs.period_len)
+        self.tokenizer = PhaseTokenizer(phase_len=period_len)
+        self.num_periods_input = self.tokenizer.period_count(self.seq_len)
+        self.num_periods_output = self.tokenizer.period_count(self.pred_len)
+        combined_periods = self.num_periods_input + self.num_periods_output
+
+        self.latent_dim = int(getattr(configs, "latent_dim", 8))
+        self.phase_layers = int(getattr(configs, "phase_layers", 1))
+
+        self.embedding = PhaseEmbedding(
+            p_in=combined_periods,
+            latent_dim=self.latent_dim,
+            hidden=int(getattr(configs, "phase_encoder_hidden", 32)),
+            use_mlp=bool(getattr(configs, "phase_encoder_use_mlp", False)),
+            dropout=float(getattr(configs, "phase_encoder_dropout", 0.0)),
+        )
+        self.routing_layers = nn.ModuleList(
+            self._build_routing_layers(configs, combined_periods, period_len)
+        )
+        self.predictor = PhasePredictor(
+            p_out=self.num_periods_output,
+            latent_dim=self.latent_dim,
+            hidden=int(getattr(configs, "predictor_hidden", 64)),
+            use_mlp=bool(getattr(configs, "predictor_use_mlp", False)),
+            dropout=float(getattr(configs, "predictor_dropout", 0.0)),
+        )
 
     def forward(
         self,
@@ -125,13 +68,19 @@ class PhaseRAGForecaster(DefaultPLModule):
         x_mark_enc: torch.Tensor | None = None,
         x_dec: torch.Tensor | None = None,
         x_mark_dec: torch.Tensor | None = None,
+        query_index: torch.Tensor | None = None,
         *_args,
         **_kwargs,
-    ) -> PhaseRAGOutput:
-        y_base = self._run_backbone(x_enc, x_mark_enc, x_dec, x_mark_dec)
-        evidence = self.retriever(x_enc)
-        y_final, adapter_state = self.adapter(x_enc, y_base, evidence)
-        return y_final, y_base, evidence, adapter_state
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x_hat, x_last = offset_normalize(x_enc)
+        retrieval_future = self.retriever(x_hat, query_index)
+
+        x_phase = self.tokenizer.to_phase(x_hat)
+        retrieval_phase = self.tokenizer.to_phase(retrieval_future)
+
+        y_final = self._predict(x_phase, retrieval_phase) + x_last
+        y_base = self._predict(x_phase, torch.zeros_like(retrieval_phase)) + x_last
+        return y_final, y_base
 
     def training_step(self, batch, _batch_idx) -> torch.Tensor:
         return self._loss_step(batch, "train")
@@ -140,90 +89,84 @@ class PhaseRAGForecaster(DefaultPLModule):
         return self._loss_step(batch, "val")
 
     def test_step(self, batch, _batch_idx) -> dict[str, torch.Tensor]:
-        batch_x, batch_y, batch_x_mark, batch_y_mark = self._prepare_batch(batch)
-        dec_inp = self._build_decoder_input(batch_y)
-        y_final, y_base, _, _ = self(
-            x_enc=batch_x,
-            x_mark_enc=batch_x_mark,
-            x_dec=dec_inp,
-            x_mark_dec=batch_y_mark,
-        )
+        batch_x, batch_y, _ = self._unpack(batch)
+        y_final, y_base = self(x_enc=batch_x)
+        y_final, y_base, target = self._align(y_final, y_base, batch_y)
 
-        y_final, y_base, target = self._align_outputs(y_final, y_base, batch_y)
         final_metrics = metric(y_final.detach(), target.detach())
         base_metrics = metric(y_base.detach(), target.detach())
-        logs = {f"test_{name}": value for name, value in final_metrics.items()}
-        logs.update({f"test_base_{name}": value for name, value in base_metrics.items()})
-        self.log_dict(logs, on_epoch=True)
+        self.log_dict(
+            {
+                "test_mae": final_metrics["mae"],
+                "test_mse": final_metrics["mse"],
+                "test_base_mae": base_metrics["mae"],
+                "test_base_mse": base_metrics["mse"],
+            },
+            on_epoch=True,
+        )
         return final_metrics
 
     def _loss_step(self, batch, stage: str) -> torch.Tensor:
-        batch_x, batch_y, batch_x_mark, batch_y_mark = self._prepare_batch(batch)
-        dec_inp = self._build_decoder_input(batch_y)
-        y_final, y_base, evidence, adapter_state = self(
-            x_enc=batch_x,
-            x_mark_enc=batch_x_mark,
-            x_dec=dec_inp,
-            x_mark_dec=batch_y_mark,
-        )
+        batch_x, batch_y, query_index = self._unpack(batch)
+        y_final, y_base = self(x_enc=batch_x, query_index=query_index)
+        y_final, y_base, target = self._align(y_final, y_base, batch_y)
 
-        y_final, y_base, target = self._align_outputs(y_final, y_base, batch_y)
-        final_loss = self._forecast_loss(y_final, target)
-        base_loss = self._forecast_loss(y_base, target)
+        final_loss = nn.functional.mse_loss(y_final, target)
+        base_loss = nn.functional.mse_loss(y_base, target)
         loss = final_loss + self.lambda_base * base_loss
 
         self.log(f"{stage}_loss", loss, on_epoch=True, prog_bar=True)
         self.log(f"{stage}_final_loss", final_loss, on_epoch=True)
         self.log(f"{stage}_base_loss", base_loss, on_epoch=True)
-        self.log(f"{stage}_gate_mean", adapter_state["gate"].mean(), on_epoch=True)
-        self.log(
-            f"{stage}_retrieval_confidence",
-            evidence["confidence"].mean(),
-            on_epoch=True,
-        )
         return loss
 
-    def _run_backbone(
+    def _predict(
         self,
-        x_enc: torch.Tensor,
-        x_mark_enc: torch.Tensor | None,
-        x_dec: torch.Tensor | None,
-        x_mark_dec: torch.Tensor | None,
+        x_phase: torch.Tensor,
+        retrieval_phase: torch.Tensor,
     ) -> torch.Tensor:
-        if self.freeze_backbone:
-            self.backbone.eval()
-            with torch.no_grad():
-                output = self.backbone(
-                    x_enc=x_enc,
-                    x_mark_enc=x_mark_enc,
-                    x_dec=x_dec,
-                    x_mark_dec=x_mark_dec,
+        combined = torch.cat([x_phase, retrieval_phase], dim=-1)
+        latent = self.embedding(combined)
+        current = combined
+        for layer_index, unit in enumerate(self.routing_layers):
+            latent, phase_steps = unit(current, latent)
+            if layer_index < len(self.routing_layers) - 1:
+                current = phase_steps
+        y_phase = self.predictor(latent)
+        return self.tokenizer.to_time(y_phase, self.pred_len)
+
+    def _build_routing_layers(self, configs, num_periods: int, period_len: int):
+        layers = []
+        for layer_index in range(self.phase_layers):
+            is_first = layer_index == 0
+            is_last = layer_index == self.phase_layers - 1
+            layers.append(
+                CrossPhaseRoutingUnit(
+                    apply_in_proj=not is_first,
+                    apply_out_proj=not is_last,
+                    num_periods_input=num_periods,
+                    latent_dim=self.latent_dim,
+                    phase_attn_heads=int(getattr(configs, "phase_attn_heads", 4)),
+                    phase_attn_dropout=float(getattr(configs, "phase_attn_dropout", 0.0)),
+                    period_len=period_len,
+                    phase_attention_dim=getattr(configs, "phase_attention_dim", None),
+                    phase_num_routers=int(getattr(configs, "phase_num_routers", 8)),
+                    phase_use_pos_embed=bool(getattr(configs, "phase_use_pos_embed", False)),
+                    phase_pos_dropout=float(getattr(configs, "phase_pos_dropout", 0.0)),
                 )
-        else:
-            output = self.backbone(
-                x_enc=x_enc,
-                x_mark_enc=x_mark_enc,
-                x_dec=x_dec,
-                x_mark_dec=x_mark_dec,
             )
+        return layers
 
-        if isinstance(output, tuple):
-            return output[0]
-        return output
-
-    def _prepare_batch(
+    def _unpack(
         self,
         batch,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch_x, batch_y, batch_x_mark, batch_y_mark = batch
-        return (
-            batch_x.float(),
-            batch_y.float(),
-            batch_x_mark.float(),
-            batch_y_mark.float(),
-        )
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        batch_x = batch[0].float()
+        batch_y = batch[1].float()
+        query_index = batch[4] if len(batch) > 4 else None
+        return batch_x, batch_y, query_index
 
-    def _align_outputs(
+    def _align(
         self,
         y_final: torch.Tensor,
         y_base: torch.Tensor,
@@ -232,84 +175,9 @@ class PhaseRAGForecaster(DefaultPLModule):
         y_final = y_final[:, -self.pred_len :, :]
         y_base = y_base[:, -self.pred_len :, :]
         target = batch_y[:, -self.pred_len :, :]
-
         if self.target_var_index != -1:
-            target_index = self.target_var_index
-            y_final = y_final[:, :, target_index].unsqueeze(-1)
-            y_base = y_base[:, :, target_index].unsqueeze(-1)
-            target = target[:, :, target_index].unsqueeze(-1)
-
+            index = self.target_var_index
+            y_final = y_final[:, :, index].unsqueeze(-1)
+            y_base = y_base[:, :, index].unsqueeze(-1)
+            target = target[:, :, index].unsqueeze(-1)
         return y_final, y_base, target
-
-    def _forecast_loss(self, outputs: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        loss_func = str(getattr(self.args.training_args, "loss_func", "")).lower()
-        if bool(getattr(self.args, "use_huber_loss", False)) or loss_func == "huber":
-            return self._huber_loss(outputs, target)
-
-        criterion = self._get_criterion(self.args.training_args.loss_func)
-        return criterion(outputs, target)
-
-    def _huber_loss(self, outputs: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        delta = torch.as_tensor(
-            getattr(self.args, "huber_delta", 1.0),
-            device=outputs.device,
-            dtype=outputs.dtype,
-        )
-        diff = outputs - target
-        abs_diff = diff.abs()
-        quadratic = torch.minimum(abs_diff, delta)
-        linear = abs_diff - quadratic
-        return (0.5 * quadratic.pow(2) / delta + linear).mean()
-
-    def _freeze_backbone(self) -> None:
-        for parameter in self.backbone.parameters():
-            parameter.requires_grad = False
-        self.backbone.eval()
-
-
-class PhaseFormerForecaster(DefaultPLModule):
-    """Stage-1 module that trains the PhaseFormer backbone on its own."""
-
-    def __init__(self, configs, backbone: nn.Module) -> None:
-        super().__init__(configs)
-        self.backbone = backbone
-        self.pred_len = configs.pred_len
-
-    def forward(
-        self,
-        x_enc: torch.Tensor,
-        x_mark_enc: torch.Tensor | None = None,
-        x_dec: torch.Tensor | None = None,
-        x_mark_dec: torch.Tensor | None = None,
-        *_args,
-        **_kwargs,
-    ) -> torch.Tensor:
-        output = self.backbone(
-            x_enc=x_enc,
-            x_mark_enc=x_mark_enc,
-            x_dec=x_dec,
-            x_mark_dec=x_mark_dec,
-        )
-        if isinstance(output, tuple):
-            return output[0]
-        return output
-
-    def training_step(self, batch, _batch_idx) -> torch.Tensor:
-        return self._step(batch, "train")
-
-    def validation_step(self, batch, _batch_idx) -> torch.Tensor:
-        return self._step(batch, "val")
-
-    def _step(self, batch, stage: str) -> torch.Tensor:
-        batch_x, batch_y = batch[0].float(), batch[1].float()
-        outputs = self(x_enc=batch_x)
-        outputs = outputs[:, -self.pred_len :, :]
-        target = batch_y[:, -self.pred_len :, :]
-        if self.target_var_index != -1:
-            outputs = outputs[:, :, self.target_var_index].unsqueeze(-1)
-            target = target[:, :, self.target_var_index].unsqueeze(-1)
-
-        criterion = self._get_criterion(self.args.training_args.loss_func)
-        loss = criterion(outputs, target)
-        self.log(f"{stage}_loss", loss, on_epoch=True, prog_bar=True)
-        return loss

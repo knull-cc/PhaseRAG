@@ -4,20 +4,16 @@ import torch
 from torch import nn
 
 
-def instance_normalize(
-    x: torch.Tensor,
-    eps: float = 1e-5,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Per-window instance norm over the time dim of a [B, L, C] tensor.
+def offset_normalize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """RAFT-style offset normalization: subtract the last timestep.
 
-    Returns the normalized tensor together with the mean and std so callers can
-    project predictions/residuals back into the original scale.
+    Returns ``(x - x_last, x_last)`` for a ``[B, L, C]`` tensor so callers can
+    compare shape/trend (ignoring level shifts) and add the offset back later.
     """
     if x.dim() != 3:
         raise ValueError("x must have shape [B, L, C]")
-    mean = x.mean(dim=1, keepdim=True)
-    std = (x.var(dim=1, keepdim=True, unbiased=False) + eps).sqrt()
-    return (x - mean) / std, mean, std
+    x_last = x[:, -1:, :]
+    return x - x_last, x_last
 
 
 class PhaseTokenizer(nn.Module):
