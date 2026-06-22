@@ -23,20 +23,13 @@ from PhaseRAG.config import base_config as config_module
 from PhaseRAG.config.base_config import AttrDict
 from PhaseRAG.config.data_factory import data_provider
 from PhaseRAG.config.data_info import DATASET_INFO
-from PhaseRAG.models import (
-    PhaseRAFTForecaster,
-    RaftRetriever,
-    build_raft_memory,
-)
+from PhaseRAG.models import PhaseRAFTForecaster, RaftRetriever, build_raft_memory
 
 
-DATASET_NAME = "ETTh1"
+DATASET_NAME = "Electricity"
 
 
 class IndexedDataset(Dataset):
-    """Wraps a dataset so each item also yields its window-start index, which the
-    retriever uses to drop overlapping patches during training."""
-
     def __init__(self, base: Dataset) -> None:
         self.base = base
 
@@ -48,12 +41,14 @@ class IndexedDataset(Dataset):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run PhaseRAG (RAFT-in-phase) on ETTh1.")
-    parser.add_argument("--seq-len", type=int, default=720)
-    parser.add_argument("--pred-len", type=int, default=720)
+    parser = argparse.ArgumentParser(
+        description="Run PhaseRAG (RAFT-in-phase) on Electricity."
+    )
+    parser.add_argument("--seq-len", type=int, default=96)
+    parser.add_argument("--pred-len", type=int, default=96)
     parser.add_argument("--period-len", type=int, default=24)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--top-k", type=int, default=8)
@@ -70,17 +65,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-retrieval",
         action="store_true",
-        help="Ablation: disable retrieval (phase predictor on the input only) to "
-        "measure how much the RAG branch actually contributes.",
+        help="Ablation: disable retrieval to measure the RAG branch contribution.",
     )
     return parser.parse_args()
 
 
 def parse_periods(text: str) -> tuple[int, ...]:
     periods = tuple(int(token) for token in text.split(",") if token.strip())
-    if not periods or any(p <= 0 for p in periods):
+    if not periods or any(period <= 0 for period in periods):
         raise ValueError("--periods must be positive integers")
     return periods
+
+
+def get_best_config_for_horizon(horizon: int) -> dict[str, int]:
+    if horizon == 96:
+        return {"predictor_hidden": 64}
+    if horizon in {192, 720}:
+        return {"predictor_hidden": 32}
+    return {"predictor_hidden": 64}
 
 
 def configure_experiment(args: argparse.Namespace) -> AttrDict:
@@ -118,8 +120,9 @@ def configure_experiment(args: argparse.Namespace) -> AttrDict:
     return exp_args
 
 
-class PhaseRAGETTh1Config:
+class PhaseRAGElectricityConfig:
     def __init__(self, exp_args: AttrDict, args: argparse.Namespace) -> None:
+        best_config = get_best_config_for_horizon(args.pred_len)
         self.seq_len = args.seq_len
         self.pred_len = args.pred_len
         self.enc_in = exp_args.model_args.num_variants
@@ -127,17 +130,7 @@ class PhaseRAGETTh1Config:
         self.target_var_index = -1
         self.training_args = exp_args.training_args
         self.dataset_args = exp_args.dataset_args
-
-        self.latent_dim = 4
-        self.phase_encoder_hidden = 16
-        self.predictor_hidden = 32
-        self.phase_layers = 3
-        self.phase_attn_heads = 1
-        self.phase_attn_dropout = 0.1
-        self.phase_attention_dim = None
-        self.phase_num_routers = 8
-        self.phase_use_pos_embed = True
-        self.phase_pos_dropout = 0.0
+        self.predictor_hidden = best_config["predictor_hidden"]
 
     def get(self, key: str, default: Any = None) -> Any:
         return getattr(self, key, default)
@@ -158,7 +151,7 @@ def make_logger(args: argparse.Namespace) -> CSVLogger:
 
 
 def build_model(
-    model_config: PhaseRAGETTh1Config,
+    model_config: PhaseRAGElectricityConfig,
     args: argparse.Namespace,
     periods: tuple[int, ...],
     memory_dataset: Dataset,
@@ -195,14 +188,12 @@ def main() -> None:
     args = parse_args()
     periods = parse_periods(args.periods)
     exp_args = configure_experiment(args)
-    model_config = PhaseRAGETTh1Config(exp_args, args)
+    model_config = PhaseRAGElectricityConfig(exp_args, args)
 
     train_dataset, _ = data_provider(exp_args.dataset_args, "train")
     _, vali_loader = data_provider(exp_args.dataset_args, "val")
     _, test_loader = data_provider(exp_args.dataset_args, "test")
 
-    # Retrieval library is the training history; query indices let the retriever
-    # exclude overlapping patches so a window never retrieves its own future.
     train_loader = DataLoader(
         IndexedDataset(train_dataset),
         batch_size=args.batch_size,

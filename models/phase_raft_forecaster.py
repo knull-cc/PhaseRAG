@@ -47,9 +47,15 @@ class PhaseRAFTForecaster(DefaultPLModule):
     forecast, with the offset added back. No backbone, no residual correction.
     """
 
-    def __init__(self, configs, retriever: RaftRetriever) -> None:
+    def __init__(
+        self,
+        configs,
+        retriever: RaftRetriever | None,
+        use_retrieval: bool = True,
+    ) -> None:
         super().__init__(configs)
         self.retriever = retriever
+        self.use_retrieval = use_retrieval and retriever is not None
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
 
@@ -71,7 +77,17 @@ class PhaseRAFTForecaster(DefaultPLModule):
         **_kwargs,
     ) -> dict[str, torch.Tensor]:
         x_hat, x_last = offset_normalize(x_enc)
-        retrieval_future, topk_similarity_mean = self.retriever(x_hat, query_index)
+        if self.use_retrieval:
+            retrieval_future, topk_similarity_mean = self.retriever(x_hat, query_index)
+        else:
+            retrieval_future = torch.zeros(
+                x_enc.size(0),
+                self.pred_len,
+                x_enc.size(2),
+                device=x_enc.device,
+                dtype=x_enc.dtype,
+            )
+            topk_similarity_mean = torch.zeros((), device=x_enc.device, dtype=x_enc.dtype)
 
         query_phase = self.tokenizer.to_phase(x_hat)
         retrieved_phase = self.tokenizer.to_phase(retrieval_future)
