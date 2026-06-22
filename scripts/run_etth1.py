@@ -11,6 +11,7 @@ import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.loggers import CSVLogger
+from torch.utils.data import DataLoader, Subset
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 for path in (PROJECT_ROOT.parent, PROJECT_ROOT):
@@ -58,6 +59,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--shift-aware", action="store_true")
     parser.add_argument("--freeze-backbone", action="store_true")
+    parser.add_argument(
+        "--memory-split",
+        choices=("val", "train"),
+        default="val",
+        help="Where to build the residual memory / train the adapter. 'val' "
+        "avoids train/test error leakage so the retrieval actually helps.",
+    )
     return parser.parse_args()
 
 
@@ -180,14 +188,14 @@ def build_rag_model(
     model_config: PhaseRAGETTh1Config,
     args: argparse.Namespace,
     backbone: PhaseFormer,
-    train_dataset,
+    memory_dataset,
 ) -> PhaseRAGForecaster:
     model_config.phase_rag_freeze_backbone = True
     device = next(backbone.parameters()).device
 
     tokenizer = PhaseTokenizer(phase_len=args.period_len)
     memory_bank = build_phase_memory_bank(
-        dataset=train_dataset,
+        dataset=memory_dataset,
         tokenizer=tokenizer,
         pred_len=args.pred_len,
         backbone=backbone,
@@ -198,6 +206,7 @@ def build_rag_model(
         device=device,
         norm_eps=model_config.revin_eps,
     )
+    print(f"[PhaseRAG] memory bank size = {memory_bank.size}")
     retriever = PhaseRetriever(
         tokenizer=tokenizer,
         memory_bank=memory_bank,
@@ -208,6 +217,80 @@ def build_rag_model(
         norm_eps=model_config.revin_eps,
     )
     return PhaseRAGForecaster(model_config, backbone=backbone, retriever=retriever)
+
+
+def _loader(dataset, args, shuffle: bool, drop_last: bool) -> DataLoader:
+    return DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=shuffle,
+        num_workers=args.num_workers,
+        drop_last=drop_last,
+    )
+
+
+def _contiguous_splits(length: int, gap: int) -> tuple[range, range, range]:
+    """Split [0, length) into disjoint memory / adapter-train / adapter-val
+    ranges (~60 / 25 / 15 of the usable space) with a gap between them to limit
+    window overlap. The two gaps are subtracted first so the regions always fit.
+    """
+    gap = max(0, min(gap, length // 20))
+    usable = length - 2 * gap
+    memory_len = int(usable * 0.60)
+    adapter_train_len = int(usable * 0.25)
+    memory_idx = range(0, memory_len)
+    adapter_train_start = memory_len + gap
+    adapter_train_idx = range(
+        adapter_train_start,
+        adapter_train_start + adapter_train_len,
+    )
+    adapter_val_idx = range(adapter_train_start + adapter_train_len + gap, length)
+    if min(len(memory_idx), len(adapter_train_idx), len(adapter_val_idx)) == 0:
+        raise ValueError(
+            "validation split is too small for leakage-free memory; "
+            "use --memory-split train or a shorter --pred-len"
+        )
+    return memory_idx, adapter_train_idx, adapter_val_idx
+
+
+def prepare_stage2_data(
+    args: argparse.Namespace,
+    exp_args: AttrDict,
+    train_dataset,
+    train_loader,
+    vali_loader,
+):
+    """Returns (memory_dataset, adapter_loader, adapter_val_loader).
+
+    With --memory-split val (default) the residual memory and the gate adapter
+    are built on the validation series, which the backbone never trained on, so
+    the stored residuals are genuine generalization errors rather than
+    overfit training noise. The three regions are disjoint to avoid retrieving a
+    sample's own future during adapter training/validation.
+    """
+    if args.memory_split == "train":
+        return train_dataset, train_loader, vali_loader
+
+    val_dataset, _ = data_provider(exp_args.dataset_args, "val")
+    gap = args.pred_len
+    memory_idx, adapter_train_idx, adapter_val_idx = _contiguous_splits(
+        len(val_dataset),
+        gap,
+    )
+    memory_dataset = Subset(val_dataset, list(memory_idx))
+    adapter_loader = _loader(
+        Subset(val_dataset, list(adapter_train_idx)),
+        args,
+        shuffle=True,
+        drop_last=False,
+    )
+    adapter_val_loader = _loader(
+        Subset(val_dataset, list(adapter_val_idx)),
+        args,
+        shuffle=False,
+        drop_last=False,
+    )
+    return memory_dataset, adapter_loader, adapter_val_loader
 
 
 def main() -> None:
@@ -223,14 +306,25 @@ def main() -> None:
     _, vali_loader = data_provider(exp_args.dataset_args, "val")
     _, test_loader = data_provider(exp_args.dataset_args, "test")
 
-    # Stage 1: train and freeze the PhaseFormer backbone.
+    # Stage 1: train and freeze the PhaseFormer backbone on the full train set.
     backbone = pretrain_backbone(model_config, args, train_loader, vali_loader)
 
-    # Stage 2: build the residual memory from the frozen backbone, then train
-    # only the retrieval adapter to correct the backbone's errors.
-    model = build_rag_model(model_config, args, backbone, train_dataset)
+    # Stage 2: build the residual memory from data the frozen backbone never
+    # trained on, then train only the retrieval adapter to correct its errors.
+    memory_dataset, adapter_loader, adapter_val_loader = prepare_stage2_data(
+        args,
+        exp_args,
+        train_dataset,
+        train_loader,
+        vali_loader,
+    )
+    model = build_rag_model(model_config, args, backbone, memory_dataset)
     trainer = make_trainer(args, "rag", args.epochs)
-    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=vali_loader)
+    trainer.fit(
+        model,
+        train_dataloaders=adapter_loader,
+        val_dataloaders=adapter_val_loader,
+    )
     trainer.test(model, dataloaders=test_loader)
 
 

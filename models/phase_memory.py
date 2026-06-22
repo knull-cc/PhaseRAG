@@ -52,7 +52,6 @@ class PhaseMemoryBank(nn.Module):
         if max_items is not None and max_items <= 0:
             raise ValueError("max_items must be positive when provided")
 
-        cls._ensure_train_split(dataset)
         memory_dataset = cls._build_subset(dataset, stride, max_items)
         loader = DataLoader(
             memory_dataset,
@@ -135,12 +134,6 @@ class PhaseMemoryBank(nn.Module):
             raise ValueError("key_phase and residual_phase must have the same C")
         if key_phase.size(2) != residual_phase.size(2):
             raise ValueError("key_phase and residual_phase must share L_phase")
-
-    @staticmethod
-    def _ensure_train_split(dataset: Dataset) -> None:
-        split_id = getattr(dataset, "set_type", None)
-        if split_id is not None and int(split_id) != 0:
-            raise ValueError("PhaseMemoryBank must be built from the train split")
 
     @staticmethod
     def _build_subset(
