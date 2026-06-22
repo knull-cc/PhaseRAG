@@ -5,11 +5,16 @@ import torch.nn.functional as F
 from torch import nn
 
 from PhaseRAG.models.phase_memory import PhaseMemoryBank
-from PhaseRAG.models.phase_tokenizer import PhaseTokenizer
+from PhaseRAG.models.phase_tokenizer import PhaseTokenizer, instance_normalize
 
 
 class PhaseRetriever(nn.Module):
-    """Retrieves phase-domain residual evidence from a PhaseMemoryBank."""
+    """Retrieves phase-domain residual evidence from a PhaseMemoryBank.
+
+    Matching happens in the same per-window instance-normalized space the memory
+    bank was built in, so the retrieved residual is a scale-free correction that
+    the caller rescales with the query's own statistics.
+    """
 
     def __init__(
         self,
@@ -20,6 +25,7 @@ class PhaseRetriever(nn.Module):
         similarity: str = "cosine",
         shift_aware: bool = False,
         similarity_threshold: float | None = None,
+        norm_eps: float = 1e-5,
     ) -> None:
         super().__init__()
         if top_k <= 0:
@@ -36,9 +42,12 @@ class PhaseRetriever(nn.Module):
         self.similarity = similarity
         self.shift_aware = shift_aware
         self.similarity_threshold = similarity_threshold
+        self.norm_eps = norm_eps
+        self._normalized_key_cache: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        query_phase = self.tokenizer.to_phase(x)
+        x_norm, _, _ = instance_normalize(x, self.norm_eps)
+        query_phase = self.tokenizer.to_phase(x_norm)
         similarities, shifts = self._compute_similarities(query_phase)
 
         top_k = min(self.top_k, self.memory_bank.size)
@@ -51,17 +60,10 @@ class PhaseRetriever(nn.Module):
             top_shifts,
             x,
         )
-        future_candidates = self._gather_candidates(
-            self.memory_bank.future_phase,
-            top_indices,
-            top_shifts,
-            x,
-        )
 
         weights = self._weights(top_values)
         weight_view = weights[:, :, None, None, None]
         retrieved_residual = (residual_candidates * weight_view).sum(dim=1)
-        retrieved_future = (future_candidates * weight_view).sum(dim=1)
 
         return {
             "query_phase": query_phase,
@@ -70,7 +72,6 @@ class PhaseRetriever(nn.Module):
             "weights": weights,
             "best_shifts": top_shifts,
             "retrieved_residual_phase": retrieved_residual,
-            "retrieved_future_phase": retrieved_future,
             "confidence": self._confidence(top_values),
         }
 
@@ -78,18 +79,21 @@ class PhaseRetriever(nn.Module):
         self,
         query_phase: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        memory_key = self._match_query_tensor(self.memory_bank.key_phase, query_phase)
+        query = self._normalize_rows(query_phase.reshape(query_phase.size(0), -1))
 
         if not self.shift_aware:
-            similarities = self._similarity(query_phase, memory_key)
+            key = self._normalized_memory_key(query_phase)
+            similarities = query.matmul(key.transpose(0, 1))
             shifts = torch.zeros_like(similarities, dtype=torch.long)
             return similarities, shifts
 
+        memory_key = self._match_query_tensor(self.memory_bank.key_phase, query_phase)
         best_similarities = None
         best_shifts = None
         for shift in range(self.tokenizer.phase_len):
             shifted_key = torch.roll(memory_key, shifts=shift, dims=2)
-            shifted_similarity = self._similarity(query_phase, shifted_key)
+            key = self._normalize_rows(shifted_key.reshape(shifted_key.size(0), -1))
+            shifted_similarity = query.matmul(key.transpose(0, 1))
             shift_tensor = torch.full_like(shifted_similarity, shift, dtype=torch.long)
 
             if best_similarities is None:
@@ -107,21 +111,23 @@ class PhaseRetriever(nn.Module):
 
         return best_similarities, best_shifts
 
-    def _similarity(
-        self,
-        query_phase: torch.Tensor,
-        memory_key: torch.Tensor,
-    ) -> torch.Tensor:
-        query = query_phase.reshape(query_phase.size(0), -1)
-        key = memory_key.reshape(memory_key.size(0), -1)
-
+    def _normalize_rows(self, rows: torch.Tensor) -> torch.Tensor:
         if self.similarity == "pearson":
-            query = query - query.mean(dim=1, keepdim=True)
-            key = key - key.mean(dim=1, keepdim=True)
+            rows = rows - rows.mean(dim=1, keepdim=True)
+        return F.normalize(rows, dim=1, eps=1e-8)
 
-        query = F.normalize(query, dim=1, eps=1e-8)
-        key = F.normalize(key, dim=1, eps=1e-8)
-        return query.matmul(key.transpose(0, 1))
+    def _normalized_memory_key(self, reference: torch.Tensor) -> torch.Tensor:
+        cache = self._normalized_key_cache
+        if (
+            cache is None
+            or cache.device != reference.device
+            or cache.dtype != reference.dtype
+        ):
+            key = self.memory_bank.key_phase.reshape(self.memory_bank.size, -1)
+            key = self._match_query_tensor(key, reference)
+            cache = self._normalize_rows(key)
+            self._normalized_key_cache = cache
+        return cache
 
     def _gather_candidates(
         self,

@@ -4,6 +4,22 @@ import torch
 from torch import nn
 
 
+def instance_normalize(
+    x: torch.Tensor,
+    eps: float = 1e-5,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-window instance norm over the time dim of a [B, L, C] tensor.
+
+    Returns the normalized tensor together with the mean and std so callers can
+    project predictions/residuals back into the original scale.
+    """
+    if x.dim() != 3:
+        raise ValueError("x must have shape [B, L, C]")
+    mean = x.mean(dim=1, keepdim=True)
+    std = (x.var(dim=1, keepdim=True, unbiased=False) + eps).sqrt()
+    return (x - mean) / std, mean, std
+
+
 class PhaseTokenizer(nn.Module):
     """Converts time-domain sequences to phase-period matrices and back."""
 

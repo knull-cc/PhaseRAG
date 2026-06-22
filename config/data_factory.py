@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from torch.utils.data import DataLoader
 
-from PhaseRAG.dataset.data_loader import DatasetETTHourMulti
+from PhaseRAG.config.data_loader import DatasetETTHourMulti
 
 
 DATASETS = {

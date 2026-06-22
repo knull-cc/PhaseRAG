@@ -12,7 +12,7 @@ class DefaultPLModule(pl.LightningModule):
         super().__init__()
         self.args = configs
         self.target_var_index = int(configs.get("target_var_index", -1))
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["backbone", "retriever"])
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(

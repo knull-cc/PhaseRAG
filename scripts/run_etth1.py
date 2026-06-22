@@ -20,10 +20,11 @@ for path in (PROJECT_ROOT.parent, PROJECT_ROOT):
 
 from PhaseRAG.config import base_config as config_module
 from PhaseRAG.config.base_config import AttrDict
-from PhaseRAG.dataset.data_factory import data_provider
-from PhaseRAG.dataset.data_info import DATASET_INFO
+from PhaseRAG.config.data_factory import data_provider
+from PhaseRAG.config.data_info import DATASET_INFO
 from PhaseRAG.models import (
     PhaseFormer,
+    PhaseFormerForecaster,
     PhaseRAGForecaster,
     PhaseRetriever,
     PhaseTokenizer,
@@ -44,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pred-len", type=int, default=720)
     parser.add_argument("--period-len", type=int, default=24)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--pretrain-epochs", type=int, default=30)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -131,19 +133,70 @@ class PhaseRAGETTh1Config:
         return getattr(self, key, default)
 
 
-def build_model(exp_args: AttrDict, args: argparse.Namespace) -> PhaseRAGForecaster:
-    model_config = PhaseRAGETTh1Config(exp_args, args)
-    train_dataset, _ = data_provider(exp_args.dataset_args, "train")
+def make_logger(args: argparse.Namespace, stage: str) -> CSVLogger:
+    shift_name = "shift" if args.shift_aware else "plain"
+    version = (
+        f"{DATASET_NAME}-{args.seq_len}-{args.pred_len}-{stage}"
+        f"-p{args.period_len}-top{args.top_k}-{shift_name}"
+        f"-mem{args.max_memory_items}-tau{args.temperature}"
+    )
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return CSVLogger(
+        save_dir="./log/training_results",
+        name="PhaseRAG",
+        version=f"{version}-{stage}-{timestamp}",
+    )
+
+
+def make_trainer(args: argparse.Namespace, stage: str, max_epochs: int) -> pl.Trainer:
+    return pl.Trainer(
+        accelerator="auto",
+        devices=1,
+        max_epochs=max_epochs,
+        logger=make_logger(args, stage),
+        callbacks=[EarlyStopping(monitor="val_loss", patience=args.patience)],
+        enable_checkpointing=True,
+        enable_progress_bar=True,
+        log_every_n_steps=1,
+        deterministic=True,
+    )
+
+
+def pretrain_backbone(
+    model_config: PhaseRAGETTh1Config,
+    args: argparse.Namespace,
+    train_loader,
+    vali_loader,
+) -> PhaseFormer:
+    backbone = PhaseFormer(model_config)
+    stage1 = PhaseFormerForecaster(model_config, backbone=backbone)
+    trainer = make_trainer(args, "backbone", args.pretrain_epochs)
+    trainer.fit(stage1, train_dataloaders=train_loader, val_dataloaders=vali_loader)
+    backbone.eval()
+    return backbone
+
+
+def build_rag_model(
+    model_config: PhaseRAGETTh1Config,
+    args: argparse.Namespace,
+    backbone: PhaseFormer,
+    train_dataset,
+) -> PhaseRAGForecaster:
+    model_config.phase_rag_freeze_backbone = True
+    device = next(backbone.parameters()).device
 
     tokenizer = PhaseTokenizer(phase_len=args.period_len)
     memory_bank = build_phase_memory_bank(
         dataset=train_dataset,
         tokenizer=tokenizer,
         pred_len=args.pred_len,
+        backbone=backbone,
         batch_size=args.batch_size,
         stride=args.memory_stride,
         max_items=args.max_memory_items,
         num_workers=args.num_workers,
+        device=device,
+        norm_eps=model_config.revin_eps,
     )
     retriever = PhaseRetriever(
         tokenizer=tokenizer,
@@ -152,24 +205,9 @@ def build_model(exp_args: AttrDict, args: argparse.Namespace) -> PhaseRAGForecas
         temperature=args.temperature,
         similarity="cosine",
         shift_aware=args.shift_aware,
+        norm_eps=model_config.revin_eps,
     )
-    backbone = PhaseFormer(model_config)
     return PhaseRAGForecaster(model_config, backbone=backbone, retriever=retriever)
-
-
-def make_logger(args: argparse.Namespace) -> CSVLogger:
-    shift_name = "shift" if args.shift_aware else "plain"
-    version = (
-        f"{DATASET_NAME}-{args.seq_len}-{args.pred_len}-PhaseRAG"
-        f"-p{args.period_len}-top{args.top_k}-{shift_name}"
-        f"-mem{args.max_memory_items}-tau{args.temperature}"
-    )
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return CSVLogger(
-        save_dir="./log/training_results",
-        name="PhaseRAG",
-        version=f"{version}-{timestamp}",
-    )
 
 
 def main() -> None:
@@ -179,23 +217,19 @@ def main() -> None:
 
     args = parse_args()
     exp_args = configure_experiment(args)
-    model = build_model(exp_args, args)
+    model_config = PhaseRAGETTh1Config(exp_args, args)
 
-    _, train_loader = data_provider(exp_args.dataset_args, "train")
+    train_dataset, train_loader = data_provider(exp_args.dataset_args, "train")
     _, vali_loader = data_provider(exp_args.dataset_args, "val")
     _, test_loader = data_provider(exp_args.dataset_args, "test")
 
-    trainer = pl.Trainer(
-        accelerator="auto",
-        devices=1,
-        max_epochs=args.epochs,
-        logger=make_logger(args),
-        callbacks=[EarlyStopping(monitor="val_loss", patience=args.patience)],
-        enable_checkpointing=True,
-        enable_progress_bar=True,
-        log_every_n_steps=1,
-        deterministic=True,
-    )
+    # Stage 1: train and freeze the PhaseFormer backbone.
+    backbone = pretrain_backbone(model_config, args, train_loader, vali_loader)
+
+    # Stage 2: build the residual memory from the frozen backbone, then train
+    # only the retrieval adapter to correct the backbone's errors.
+    model = build_rag_model(model_config, args, backbone, train_dataset)
+    trainer = make_trainer(args, "rag", args.epochs)
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=vali_loader)
     trainer.test(model, dataloaders=test_loader)
 

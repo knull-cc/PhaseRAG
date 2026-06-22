@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from PhaseRAG.models.phase_retriever import PhaseRetriever
-from PhaseRAG.models.phase_tokenizer import PhaseTokenizer
+from PhaseRAG.models.phase_tokenizer import PhaseTokenizer, instance_normalize
 from PhaseRAG.models.pl_bases.default_module import DefaultPLModule
 from PhaseRAG.utils.metrics import metric
 
@@ -16,21 +16,32 @@ PhaseRAGOutput = tuple[
     dict[str, torch.Tensor],
 ]
 
+GATE_FEATURE_DIM = 5
+
 
 class PhaseResidualAdapter(nn.Module):
-    """Gated residual fusion in phase space."""
+    """Gated fusion of a retrieved, scale-free residual correction.
+
+    The retrieved residual lives in the per-window normalized space, so it is
+    rescaled by the query's own std before being added (in the time domain) to
+    the backbone prediction. The gate only sees scale-invariant features
+    (similarities, confidence, normalized residual magnitude) so it is not
+    confused by raw-amplitude differences between series.
+    """
 
     def __init__(
         self,
         tokenizer: PhaseTokenizer,
         pred_len: int,
         hidden_dim: int = 32,
+        norm_eps: float = 1e-5,
     ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
         self.pred_len = pred_len
+        self.norm_eps = norm_eps
         self.gate = nn.Sequential(
-            nn.Linear(6, hidden_dim),
+            nn.Linear(GATE_FEATURE_DIM, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid(),
@@ -42,29 +53,21 @@ class PhaseResidualAdapter(nn.Module):
         y_base: torch.Tensor,
         evidence: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        query_phase = evidence["query_phase"]
-        y_base_phase = self.tokenizer.to_phase(y_base)
         residual_phase = evidence["retrieved_residual_phase"]
+        residual_time = self.tokenizer.to_time(residual_phase, self.pred_len)
 
-        if y_base_phase.shape != residual_phase.shape:
-            raise ValueError("base prediction and retrieved residual phase shapes differ")
+        _, _, std_x = instance_normalize(x, self.norm_eps)
 
-        gate = self._gate(x, query_phase, residual_phase, evidence)
-        y_final_phase = y_base_phase + gate * residual_phase
-        y_final = self.tokenizer.to_time(y_final_phase, self.pred_len)
-        return y_final, {"gate": gate, "y_final_phase": y_final_phase}
+        gate = self._gate(residual_phase, evidence)
+        y_final = y_base + gate * residual_time * std_x
+        return y_final, {"gate": gate, "residual_time": residual_time}
 
     def _gate(
         self,
-        x: torch.Tensor,
-        query_phase: torch.Tensor,
         residual_phase: torch.Tensor,
         evidence: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        channel_count = query_phase.size(1)
-        query_mean = query_phase.mean(dim=(2, 3))
-        query_std = query_phase.std(dim=(2, 3), unbiased=False)
-        last_value = x[:, -1, :]
+        channel_count = residual_phase.size(1)
         residual_scale = residual_phase.abs().mean(dim=(2, 3))
 
         max_similarity = evidence["similarities"].max(dim=1).values
@@ -77,16 +80,16 @@ class PhaseResidualAdapter(nn.Module):
 
         gate_input = torch.stack(
             [
-                last_value,
-                query_mean,
-                query_std,
                 residual_scale,
                 max_similarity,
+                mean_similarity,
+                confidence,
                 mean_similarity * confidence,
             ],
             dim=-1,
         )
-        return self.gate(gate_input).unsqueeze(-1)
+        gate = self.gate(gate_input).squeeze(-1)
+        return gate[:, None, :]
 
 
 class PhaseRAGForecaster(DefaultPLModule):
@@ -105,10 +108,12 @@ class PhaseRAGForecaster(DefaultPLModule):
         self.lambda_base = float(getattr(configs, "phase_rag_lambda_base", 0.1))
         self.freeze_backbone = bool(getattr(configs, "phase_rag_freeze_backbone", True))
         gate_hidden_dim = int(getattr(configs, "phase_rag_gate_hidden_dim", 32))
+        norm_eps = float(getattr(configs, "revin_eps", 1e-5))
         self.adapter = PhaseResidualAdapter(
             tokenizer=retriever.tokenizer,
             pred_len=self.pred_len,
             hidden_dim=gate_hidden_dim,
+            norm_eps=norm_eps,
         )
 
         if self.freeze_backbone:
@@ -260,3 +265,51 @@ class PhaseRAGForecaster(DefaultPLModule):
         for parameter in self.backbone.parameters():
             parameter.requires_grad = False
         self.backbone.eval()
+
+
+class PhaseFormerForecaster(DefaultPLModule):
+    """Stage-1 module that trains the PhaseFormer backbone on its own."""
+
+    def __init__(self, configs, backbone: nn.Module) -> None:
+        super().__init__(configs)
+        self.backbone = backbone
+        self.pred_len = configs.pred_len
+
+    def forward(
+        self,
+        x_enc: torch.Tensor,
+        x_mark_enc: torch.Tensor | None = None,
+        x_dec: torch.Tensor | None = None,
+        x_mark_dec: torch.Tensor | None = None,
+        *_args,
+        **_kwargs,
+    ) -> torch.Tensor:
+        output = self.backbone(
+            x_enc=x_enc,
+            x_mark_enc=x_mark_enc,
+            x_dec=x_dec,
+            x_mark_dec=x_mark_dec,
+        )
+        if isinstance(output, tuple):
+            return output[0]
+        return output
+
+    def training_step(self, batch, _batch_idx) -> torch.Tensor:
+        return self._step(batch, "train")
+
+    def validation_step(self, batch, _batch_idx) -> torch.Tensor:
+        return self._step(batch, "val")
+
+    def _step(self, batch, stage: str) -> torch.Tensor:
+        batch_x, batch_y = batch[0].float(), batch[1].float()
+        outputs = self(x_enc=batch_x)
+        outputs = outputs[:, -self.pred_len :, :]
+        target = batch_y[:, -self.pred_len :, :]
+        if self.target_var_index != -1:
+            outputs = outputs[:, :, self.target_var_index].unsqueeze(-1)
+            target = target[:, :, self.target_var_index].unsqueeze(-1)
+
+        criterion = self._get_criterion(self.args.training_args.loss_func)
+        loss = criterion(outputs, target)
+        self.log(f"{stage}_loss", loss, on_epoch=True, prog_bar=True)
+        return loss

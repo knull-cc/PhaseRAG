@@ -35,6 +35,7 @@ class DatasetETTHourMulti(Dataset):
         else:
             self.seq_len, self.label_len, self.pred_len = size
 
+        self.data_path = data_path
         self.features = features
         self.freq = freq
         self.percent = percent
@@ -44,7 +45,6 @@ class DatasetETTHourMulti(Dataset):
         self.target = target
         self.timeenc = timeenc
         self.var_needed = var_needed
-        self.data_path = data_path
 
         self.scaler = StandardScaler()
         self._read_data()
