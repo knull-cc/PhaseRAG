@@ -48,8 +48,9 @@ class RaftRetriever(nn.Module):
         self,
         x_hat: torch.Tensor,
         query_index: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         retrieval = None
+        similarity_means = []
         for idx, period in enumerate(self.periods):
             query = downsample(x_hat, period).reshape(x_hat.size(0), -1)
             query = self._pearson_normalize(query)
@@ -61,6 +62,7 @@ class RaftRetriever(nn.Module):
             top_k = min(self.top_k, self.memory.size)
             top_values, top_indices = torch.topk(similarity, k=top_k, dim=1)
             weights = F.softmax(top_values / self.temperature, dim=1)
+            similarity_means.append(top_values.mean())
 
             value = self.memory.value(idx).to(device=x_hat.device, dtype=x_hat.dtype)
             candidates = value[top_indices]
@@ -69,7 +71,8 @@ class RaftRetriever(nn.Module):
             projected = self.projections[idx](v_tilde.transpose(1, 2)).transpose(1, 2)
             retrieval = projected if retrieval is None else retrieval + projected
 
-        return retrieval
+        topk_similarity_mean = torch.stack(similarity_means).mean()
+        return retrieval, topk_similarity_mean
 
     def _mask_overlap(
         self,

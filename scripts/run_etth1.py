@@ -24,7 +24,7 @@ from PhaseRAG.config.base_config import AttrDict
 from PhaseRAG.config.data_factory import data_provider
 from PhaseRAG.config.data_info import DATASET_INFO
 from PhaseRAG.models import (
-    PhaseRAGForecaster,
+    PhaseRAFTForecaster,
     RaftRetriever,
     build_raft_memory,
 )
@@ -60,7 +60,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--memory-stride", type=int, default=1)
     parser.add_argument("--max-memory-items", type=int, default=4096)
-    parser.add_argument("--lambda-base", type=float, default=0.1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument(
         "--periods",
@@ -134,8 +133,6 @@ class PhaseRAGETTh1Config:
         self.phase_use_pos_embed = True
         self.phase_pos_dropout = 0.0
 
-        self.phase_rag_lambda_base = args.lambda_base
-
     def get(self, key: str, default: Any = None) -> Any:
         return getattr(self, key, default)
 
@@ -159,7 +156,7 @@ def build_model(
     args: argparse.Namespace,
     periods: tuple[int, ...],
     memory_dataset: Dataset,
-) -> PhaseRAGForecaster:
+) -> PhaseRAFTForecaster:
     memory = build_raft_memory(
         dataset=memory_dataset,
         pred_len=args.pred_len,
@@ -177,7 +174,7 @@ def build_model(
         top_k=args.top_k,
         temperature=args.temperature,
     )
-    return PhaseRAGForecaster(model_config, retriever=retriever)
+    return PhaseRAFTForecaster(model_config, retriever=retriever)
 
 
 def main() -> None:

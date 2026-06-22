@@ -5,7 +5,7 @@ from PhaseRAG.models.phaseformer import PhaseFormer
 
 __all__ = [
     "PhaseFormer",
-    "PhaseRAGForecaster",
+    "PhaseRAFTForecaster",
     "PhaseTokenizer",
     "RaftPhaseMemory",
     "RaftRetriever",
@@ -14,8 +14,8 @@ __all__ = [
 
 
 def __getattr__(name: str) -> object:
-    if name == "PhaseRAGForecaster":
-        from PhaseRAG.models.phase_rag_forecaster import PhaseRAGForecaster
+    if name == "PhaseRAFTForecaster":
+        from PhaseRAG.models.phase_raft_forecaster import PhaseRAFTForecaster
 
-        return PhaseRAGForecaster
+        return PhaseRAFTForecaster
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
